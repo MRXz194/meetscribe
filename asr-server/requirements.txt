@@ -1,0 +1,9 @@
+sherpa-onnx==1.13.8
+numpy==2.4.6
+fastapi==0.143.2
+uvicorn[standard]==0.54.0
+# engine Deepgram (asr-server chuyển tiếp audio sang Deepgram)
+websockets==16.1.1
+httpx==0.28.1
+# chỉ dùng cho scripts/ (đọc file wav khi benchmark/test)
+soundfile==0.14.0

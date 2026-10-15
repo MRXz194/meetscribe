@@ -1,0 +1,84 @@
+# ==========================================
+# AI / Editor Tooling
+# ==========================================
+.claude/
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ==========================================
+# Environment & Secrets
+# ==========================================
+.env
+.env*.local
+*.env
+!.env.example
+
+# ==========================================
+# OS Files
+# ==========================================
+.DS_Store
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+
+# ==========================================
+# Logs
+# ==========================================
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ==========================================
+# Node / Next.js
+# ==========================================
+node_modules/
+.next/
+out/
+build/
+dist/
+coverage/
+*.tsbuildinfo
+next-env.d.ts
+.vercel/
+/.pnp
+.pnp.*
+
+# ==========================================
+# Python / Virtual Environments
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# ==========================================
+# ASR Models & Large Binaries (downloaded via script)
+# ==========================================
+models/
+asr-server/models/
+*.onnx
+*.tar.bz2
+*.zip
+
+# ==========================================
+# Test / Evaluation / Local Meeting Data
+# ==========================================
+asr-server/eval/
+eval/
+meetscribe/data/
+data/
+*.wav
+*.mp3
+*.pcm

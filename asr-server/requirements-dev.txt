@@ -1,0 +1,8 @@
+# Chỉ cho scripts/ (thử nghiệm, đo đạc, so engine), server không cần
+-r requirements.txt
+sentencepiece==0.2.2
+edge-tts==7.3.1
+av==18.1.0
+google-genai==2.31.0
+jiwer==4.0.0
+httpx==0.28.1

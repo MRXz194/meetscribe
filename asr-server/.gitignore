@@ -1,0 +1,36 @@
+# AI & IDE
+.claude/
+.cursor/
+.vscode/
+.idea/
+
+# Python & Virtualenv
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Models & Evaluation data (download via scripts/download_models.py)
+models/
+eval/
+*.onnx
+*.tar.bz2
+*.zip
+
+# Audio test files
+*.wav
+*.mp3
+*.pcm
+
+# Environment & Logs
+.env
+.env*.local
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
