@@ -8,7 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY scripts/download_models.py scripts/
 RUN python scripts/download_models.py
 
-COPY pipeline.py deepgram_engine.py app.py ./
+COPY pipeline.py deepgram_engine.py silence.py app.py ./
 
 ENV NUM_THREADS=4 \
     CORS_ORIGINS=http://localhost:3000

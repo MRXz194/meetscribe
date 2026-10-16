@@ -138,7 +138,7 @@ export function createMeter(streams: MediaStream[]): AudioMeter {
   };
 }
 
-/** Trộn nhiều nguồn thành 1 stream (cho engine chỉ nhận 1 kênh như Soniox Web SDK). */
+/** Trộn nhiều nguồn thành 1 stream (cho engine chỉ nhận 1 kênh). */
 export function mixToStream(streams: MediaStream[]) {
   const ctx = new AudioContext();
   void ctx.resume();

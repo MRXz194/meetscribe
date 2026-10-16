@@ -36,7 +36,7 @@ def main() -> None:
         print(f"↓ {name}")
         urllib.request.urlretrieve(f"{BASE}/{rel}", archive)
         with tarfile.open(archive) as tar:
-            tar.extractall(MODELS, filter="data")
+            tar.extractall(MODELS, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
         archive.unlink()
     for name, rel in FILES.items():
         if (MODELS / name).exists():

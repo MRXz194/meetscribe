@@ -9,6 +9,7 @@ import { Button, buttonVariants } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { useEngine } from "@/hooks/useEngine";
+import { useDeepgramLanguage } from "@/hooks/useDeepgramLanguage";
 import { formatClock } from "@/lib/transcript";
 import type { MeetingListItem, MeetingSource } from "@/lib/types";
 
@@ -23,6 +24,7 @@ export function MeetingList() {
   const [meetings, setMeetings] = useState<MeetingListItem[] | null>(null);
   const [uploading, setUploading] = useState(false);
   const [engine] = useEngine();
+  const [language] = useDeepgramLanguage();
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -35,31 +37,22 @@ export function MeetingList() {
   async function upload(file: File) {
     setUploading(true);
     try {
-      if (engine === "local" || engine === "deepgram") {
-        // Giải mã ngay trên trình duyệt, ASR server local xử lý, rồi lưu như cuộc họp thường
-        const { transcribeFileLocally } = await import("@/lib/transcriber/local");
-        const result = await transcribeFileLocally(file, engine);
-        const res = await fetch("/api/meetings", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            title: file.name.replace(/\.[^.]+$/, ""),
-            source: "upload",
-            fileName: file.name,
-            durationSec: result.durationSec,
-            segments: result.segments,
-          }),
-        });
-        const body = await res.json();
-        if (!res.ok) throw new Error(body.error ?? "Lưu thất bại");
-        router.push(`/meetings/${body.id}`);
-        return;
-      }
-      const form = new FormData();
-      form.append("file", file);
-      const res = await fetch("/api/upload", { method: "POST", body: form });
+      // Giải mã ngay trên trình duyệt, ASR server (local hoặc Deepgram) xử lý, rồi lưu như cuộc họp thường
+      const { transcribeFileLocally } = await import("@/lib/transcriber/local");
+      const result = await transcribeFileLocally(file, engine, language);
+      const res = await fetch("/api/meetings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: file.name.replace(/\.[^.]+$/, ""),
+          source: "upload",
+          fileName: file.name,
+          durationSec: result.durationSec,
+          segments: result.segments,
+        }),
+      });
       const body = await res.json();
-      if (!res.ok) throw new Error(body.error ?? "Upload thất bại");
+      if (!res.ok) throw new Error(body.error ?? "Lưu thất bại");
       router.push(`/meetings/${body.id}`);
     } catch (err) {
       toast.error((err as Error).message);

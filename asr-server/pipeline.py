@@ -32,12 +32,21 @@ ASR_MODEL_DIR = MODELS / os.environ.get("ASR_MODEL", "sherpa-onnx-zipformer-vi-3
 # Chọn từ vài file mẫu ngắn (khác người ~0.1-0.2, cùng người câu dài ~0.8), CHƯA kiểm chứng trên họp thật
 SPEAKER_THRESHOLD = float(os.environ.get("SPEAKER_THRESHOLD", "0.45"))
 SEGMENTATION_MODEL = MODELS / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx"
-DIARIZATION_THRESHOLD = float(os.environ.get("DIARIZATION_THRESHOLD", "0.5"))
+# 0.5 (mặc định cũ) tách 1 người thành 4-5 người trên hội thoại 2 giọng; 0.7 ra đúng số người cả khi có tạp âm
+# và vẫn ra đúng 3 người ở 3 giọng thật của test_pipeline. Vẫn chỉ kiểm trên dữ liệu nhỏ.
+DIARIZATION_THRESHOLD = float(os.environ.get("DIARIZATION_THRESHOLD", "0.7"))
 MIN_DIARIZATION_SEC = 3.0
+# Diarization offline tốn ~7 giây CPU mỗi phút audio (đo trên họp giả lập 2 kênh): họp 2 giờ sẽ chờ ~15 phút sau khi
+# bấm Dừng, quá thời gian chờ của trình duyệt. Họp dài hơn mức này thì bỏ bước đó, giữ nhãn live.
+MAX_REFINE_SEC = float(os.environ.get("MAX_REFINE_MIN", "45")) * 60
 # Đoạn quá ngắn thì embedding nhiễu (cùng người chỉ còn ~0.3-0.5) nên:
 # - dưới MIN_EMBED_SEC: không so giọng, gán cho người vừa nói
 # - dưới MIN_NEW_SPEAKER_SEC: được so với người cũ, nhưng không đủ bằng chứng để tạo người mới
 MIN_EMBED_SEC = 0.8
+# Câu đáp ngắn ("vâng", "dạ", "ok") rất hay gặp và gần như luôn là người KHÁC vừa nói. Gán cho người vừa nói là sai,
+# nên đoạn từ SHORT_EMBED_SEC trở lên vẫn được so giọng, nhưng chỉ nhận khi vượt hẳn người đứng nhì (SHORT_MARGIN).
+SHORT_EMBED_SEC = 0.4
+SHORT_MARGIN = 0.15
 MIN_NEW_SPEAKER_SEC = 1.2
 PARTIAL_EVERY_SEC = 0.6
 ECHO_HOLD_MS = 1500
@@ -157,10 +166,46 @@ class SpeakerTracker:
         self.sums: list[np.ndarray] = []
         self.counts: list[int] = []
         self.last: str | None = None
+        # Người "1" tạo ra từ đoạn quá ngắn để lấy embedding (vd "ừ" mở đầu): chưa có giọng thật, nhận embedding thật đầu tiên
+        self.placeholder = False
+
+    def peek(self, embedding: np.ndarray, can_create: bool) -> str | None:
+        """Đoán người đang nói mà không cập nhật gì: dùng cho chữ tạm. None = chưa đủ căn cứ."""
+        if not self.sums or self.placeholder:
+            return None
+        centroids = np.stack([s / np.linalg.norm(s) for s in self.sums])
+        sims = centroids @ embedding
+        best = int(np.argmax(sims))
+        if sims[best] >= self.threshold or len(self.sums) >= self.max_speakers:
+            return str(best + 1)
+        return str(len(self.sums) + 1) if can_create else None
+
+    def assign_short(self, embedding: np.ndarray) -> str:
+        """Đoạn rất ngắn: nhận người giống nhất nếu vượt rõ người nhì, không thì coi như người vừa nói. Không tạo người mới."""
+        if self.sums and not self.placeholder:
+            centroids = np.stack([s / np.linalg.norm(s) for s in self.sums])
+            sims = centroids @ embedding
+            order = np.argsort(sims)[::-1]
+            best = int(order[0])
+            second = float(sims[order[1]]) if len(order) > 1 else -1.0
+            if sims[best] >= 0.35 and sims[best] - second >= SHORT_MARGIN:
+                self.last = str(best + 1)
+                return self.last
+        return self.last or self.assign(None)
 
     def assign(self, embedding: np.ndarray | None, can_create: bool = True) -> str:
         if embedding is None:
-            return self.last or self._new(None)
+            if self.last:
+                return self.last
+            self.placeholder = True
+            return self._new(None)
+        if self.placeholder:
+            # Thay centroid giả bằng giọng thật, không để "ừ" đầu cuộc họp chiếm mất nhãn người nói 1
+            self.placeholder = False
+            self.sums[0] = embedding.copy()
+            self.counts[0] = 1
+            self.last = "1"
+            return self.last
         if self.sums:
             centroids = np.stack([s / np.linalg.norm(s) for s in self.sums])
             sims = centroids @ embedding
@@ -213,6 +258,7 @@ class Channel:
     received: int = 0  # tổng số sample đã nhận
     next_partial_at: int = 0
     partial: str = ""
+    partial_speaker: str | None = None  # đoán người đang nói cho chữ tạm (chỉ kênh meeting)
 
 
 class Session:
@@ -269,6 +315,12 @@ class Session:
             current = np.asarray(ch.vad.current_segment.samples, dtype=np.float32)
             if len(current) > SAMPLE_RATE * 0.4:
                 ch.partial = self.models.transcribe(current)
+                if ch.name != "mic" and len(current) >= SAMPLE_RATE * MIN_EMBED_SEC:
+                    # Chữ tạm mang nhãn đoán từ giọng đang nói, không phải nhãn của người vừa nói xong
+                    tail = current[-SAMPLE_RATE * 3 :]
+                    ch.partial_speaker = self.speakers.peek(
+                        self.models.embed(tail), can_create=len(current) >= SAMPLE_RATE * MIN_NEW_SPEAKER_SEC
+                    )
                 out.append(self._partial_msg(ch))
         return out
 
@@ -281,14 +333,19 @@ class Session:
             ch.vad.pop()
             text = self.models.transcribe(samples)
             ch.partial = ""
+            ch.partial_speaker = None
             if not text:
                 continue
             if ch.name == "mic":
                 speaker = "me"
             else:
                 dur = len(samples) / SAMPLE_RATE
-                embedding = self.models.embed(samples) if dur >= MIN_EMBED_SEC else None
-                speaker = self.speakers.assign(embedding, can_create=dur >= MIN_NEW_SPEAKER_SEC)
+                if dur >= MIN_EMBED_SEC:
+                    speaker = self.speakers.assign(self.models.embed(samples), can_create=dur >= MIN_NEW_SPEAKER_SEC)
+                elif dur >= SHORT_EMBED_SEC:
+                    speaker = self.speakers.assign_short(self.models.embed(samples))
+                else:
+                    speaker = self.speakers.assign(None)
             final = Final(
                 id=self._next_id,
                 channel=ch.name,
@@ -307,9 +364,11 @@ class Session:
 
     def _release(self, force: bool) -> list[dict]:
         """Phát các câu đã chờ đủ lâu, theo thứ tự thời gian, sau khi lọc echo."""
+        # Chỉ câu ở mic phải chờ để đối chiếu với kênh meeting; câu ở meeting phát ngay (nếu cũng chờ thì
+        # mỗi câu bị trễ thêm 1,5 s khi bật mic)
         hold = ECHO_HOLD_MS if self.echo_filter else 0
         now = self._now_ms()
-        ready = [f for f in self.held if force or now - f.end_ms >= hold]
+        ready = [f for f in self.held if force or f.channel != "mic" or now - f.end_ms >= hold]
         if not ready:
             return []
         self.held = [f for f in self.held if f not in ready]
@@ -331,45 +390,58 @@ class Session:
     def refine(self) -> dict | None:
         """Sau khi dừng: diarization offline trên cả kênh meeting, gán lại nhãn cho từng câu.
 
-        Mỗi câu nhận người nói chiếm nhiều thời gian nhất trong khoảng của nó (không chồng thì lấy
-        đoạn gần nhất). Nhãn đánh số lại theo thứ tự xuất hiện. Câu ở mic giữ nguyên "me".
-        Trả về None nếu không chạy được (thiếu model, audio quá ngắn) → client giữ nhãn live.
+        Trả về None nếu không chạy được (thiếu model, audio quá ngắn/dài) → client giữ nhãn live.
         """
-        if not self.meeting_audio:
-            return None
-        audio = np.concatenate(self.meeting_audio).astype(np.float32) / 32768.0
-        if len(audio) < MIN_DIARIZATION_SEC * SAMPLE_RATE:
-            return None
-        turns = self.models.diarize(audio)
+        turns = diarize_turns(self.models, self.meeting_audio)
         if not turns:
             return None
-
-        def best_speaker(f: Final) -> int:
-            overlap: dict[int, int] = {}
-            for start, end, spk in turns:
-                o = min(end, f.end_ms) - max(start, f.start_ms)
-                if o > 0:
-                    overlap[spk] = overlap.get(spk, 0) + o
-            if overlap:
-                return max(overlap, key=lambda s: overlap[s])
-            return min(turns, key=lambda t: min(abs(t[0] - f.end_ms), abs(t[1] - f.start_ms)))[2]
-
-        order: dict[int, str] = {}
-        segments = []
-        for f in sorted(self.emitted, key=lambda f: f.start_ms):
-            speaker = f.speaker
-            if f.channel == "meeting":
-                spk = best_speaker(f)
-                speaker = order.setdefault(spk, str(len(order) + 1))
-            segments.append({**f.to_json(), "speaker": speaker})
-        return {"type": "final_transcript", "segments": segments, "speakers": len(order)}
+        segments, n = label_by_turns(self.emitted, turns)
+        return {"type": "final_transcript", "segments": segments, "speakers": n}
 
     def _partial_msg(self, ch: Channel) -> dict:
         # Câu đã chốt nhưng còn chờ lọc echo vẫn hiện ở dạng chữ xám để không bị "khoảng trống"
         pending = [f.text for f in self.held if f.channel == ch.name]
         text = " ".join(pending + ([ch.partial] if ch.partial else []))
-        speaker = "me" if ch.name == "mic" else (self.speakers.last or "1")
+        speaker = "me" if ch.name == "mic" else (ch.partial_speaker or self.speakers.last or "1")
         return {"type": "partial", "channel": ch.name, "speaker": speaker, "text": text}
+
+
+def diarize_turns(models: Models, meeting_audio: list[np.ndarray]) -> list[tuple[int, int, int]] | None:
+    """Diarization offline trên toàn bộ kênh meeting (int16 theo từng khối). None nếu quá ngắn/dài hoặc thiếu model."""
+    if not meeting_audio:
+        return None
+    total = sum(len(a) for a in meeting_audio)
+    if total < MIN_DIARIZATION_SEC * SAMPLE_RATE or total > MAX_REFINE_SEC * SAMPLE_RATE:
+        return None
+    audio = np.concatenate(meeting_audio).astype(np.float32) / 32768.0
+    return models.diarize(audio) or None
+
+
+def label_by_turns(items: list[Final], turns: list[tuple[int, int, int]]) -> tuple[list[dict], int]:
+    """Gán lại người nói cho từng mục ở kênh meeting theo lượt nói của diarization offline.
+
+    Mỗi mục nhận người nói chiếm nhiều thời gian nhất trong khoảng của nó (không chồng thì lấy lượt gần nhất).
+    Nhãn đánh số lại theo thứ tự xuất hiện. Mục ở mic giữ nguyên "me".
+    """
+
+    def best_speaker(f: Final) -> int:
+        overlap: dict[int, int] = {}
+        for start, end, spk in turns:
+            o = min(end, f.end_ms) - max(start, f.start_ms)
+            if o > 0:
+                overlap[spk] = overlap.get(spk, 0) + o
+        if overlap:
+            return max(overlap, key=lambda s: overlap[s])
+        return min(turns, key=lambda t: min(abs(t[0] - f.end_ms), abs(t[1] - f.start_ms)))[2]
+
+    order: dict[int, str] = {}
+    segments = []
+    for f in sorted(items, key=lambda f: f.start_ms):
+        speaker = f.speaker
+        if f.channel == "meeting":
+            speaker = order.setdefault(best_speaker(f), str(len(order) + 1))
+        segments.append({**f.to_json(), "speaker": speaker})
+    return segments, len(order)
 
 
 def is_echo(mic: Final, meeting: list[Final]) -> bool:

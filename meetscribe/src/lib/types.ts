@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-/** Một token từ engine ASR, đã chuẩn hoá (không phụ thuộc Soniox). */
+/** Một token từ engine ASR, đã chuẩn hoá. */
 export type TranscriptToken = {
   text: string;
   startMs?: number;

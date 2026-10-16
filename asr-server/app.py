@@ -31,15 +31,36 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 import deepgram_engine
+from silence import SilenceWatch
 from pipeline import ASR_MODEL_DIR, SAMPLE_RATE, Models, Session, transcribe_pcm
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("asr")
 
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+    if o.strip()
+]
+LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+def origin_allowed(headers, client_host: str | None) -> bool:
+    """Chặn trang web lạ dùng ké server (và credit Deepgram) của người dùng.
+
+    CORS chỉ bảo vệ HTTP; WebSocket thì trình duyệt vẫn cho mở từ mọi trang, nên phải tự kiểm tra Origin.
+    Trình duyệt luôn gửi Origin; client không phải trình duyệt (curl, script) chỉ được nếu gọi từ chính máy này.
+    """
+    origin = headers.get("origin")
+    if origin:
+        return origin in ALLOWED_ORIGINS
+    return client_host in LOOPBACK
+
+
 app = FastAPI(title="MeetScribe ASR")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(","),
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -63,8 +84,13 @@ def health() -> dict:
 
 @app.websocket("/ws")
 async def transcribe_stream(ws: WebSocket) -> None:
+    if not origin_allowed(ws.headers, ws.client.host if ws.client else None):
+        log.warning("ws rejected: origin=%s", ws.headers.get("origin"))
+        await ws.close(code=1008)
+        return
     await ws.accept()
     session: Session | None = None
+    watch: SilenceWatch | None = None
     frame_bytes = 2
     audio_sec = proc_sec = 0.0
     try:
@@ -81,9 +107,10 @@ async def transcribe_stream(ws: WebSocket) -> None:
                     channels = data.get("channels") or ["meeting"]
                     if data.get("engine") == "deepgram":
                         # Từ đây phiên do cầu nối Deepgram xử lý đến hết (kể cả stop)
-                        await deepgram_engine.run_stream(ws, channels)
+                        await deepgram_engine.run_stream(ws, channels, data.get("language"))
                         break
                     session = Session(channels)
+                    watch = SilenceWatch(channels)
                     frame_bytes = 2 * len(channels)
                     log.info("session start channels=%s", channels)
                     await ws.send_json({"type": "ready"})
@@ -102,9 +129,10 @@ async def transcribe_stream(ws: WebSocket) -> None:
                         await ws.send_json(refined)
                     await ws.send_json({"type": "done"})
                     log.info(
-                        "session done audio=%.1fs cpu=%.2fs rtf=%.3f live_speakers=%d final_speakers=%s refine=%.1fs",
+                        "session done audio=%.1fs cpu=%.2fs rtf=%.3f live_speakers=%d final_speakers=%s refine=%.1fs %s",
                         audio_sec, proc_sec, proc_sec / max(audio_sec, 1e-6), len(session.speakers.sums),
                         refined["speakers"] if refined else "-", time.perf_counter() - t,
+                        watch.summary() if watch else "",
                     )
                     break
             elif msg.get("bytes") is not None and session:
@@ -112,6 +140,9 @@ async def transcribe_stream(ws: WebSocket) -> None:
                 pcm = pcm[: len(pcm) // frame_bytes * frame_bytes]
                 t = time.perf_counter()
                 outs = await asyncio.to_thread(session.feed, pcm)
+                if watch:
+                    watch.feed(pcm)
+                    outs += watch.poll()
                 proc_sec += time.perf_counter() - t
                 audio_sec += len(pcm) / frame_bytes / SAMPLE_RATE
                 for out in outs:
@@ -132,11 +163,13 @@ async def transcribe_stream(ws: WebSocket) -> None:
 
 
 @app.post("/transcribe")
-async def transcribe_file(request: Request, engine: str = "local") -> dict:
+async def transcribe_file(request: Request, engine: str = "local", language: str | None = None) -> dict:
+    if not origin_allowed(request.headers, request.client.host if request.client else None):
+        return JSONResponse({"error": "Origin không được phép"}, status_code=403)
     pcm = await request.body()
     pcm = pcm[: len(pcm) // 2 * 2]
     t = time.perf_counter()
-    run = deepgram_engine.transcribe_pcm if engine == "deepgram" else transcribe_pcm
+    run = (lambda pcm: deepgram_engine.transcribe_pcm(pcm, language)) if engine == "deepgram" else transcribe_pcm
     try:
         segments = await asyncio.to_thread(run, pcm)
     except RuntimeError as err:

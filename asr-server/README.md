@@ -24,8 +24,12 @@ trình duyệt ── PCM16 2 kênh ──► asr-server ── Authorization: T
 - Kênh mic vẫn là "me" nhờ `multichannel=true`. Kênh meeting lấy người nói từ diarization của Deepgram; một đoạn final có nhiều người thì được tách theo từng cụm từ.
 - Lọc tiếng vọng dùng lại `is_echo` của pipeline local.
 - Key: `DEEPGRAM_API_KEY` trong biến môi trường, `asr-server/.env` hoặc `meetscribe/.env.local` (đọc lại mỗi phiên, không cần khởi động lại). `/health` trả `engines.deepgram` để web biết đã có key chưa.
-- Chi phí: Deepgram tính theo từng kênh, ghi có mic là 2 kênh.
-- **Chưa test với key thật**: đã test logic bằng message giả lập (`scripts/test_deepgram_bridge.py`) và đường lỗi với key giả (Deepgram trả 401). Tham số streaming (`diarize=true`, `language=vi`) cần xác nhận ở lần chạy thật đầu tiên.
+- Chi phí: Deepgram tính theo từng kênh, ghi có mic là 2 kênh. Giới hạn `DEEPGRAM_MAX_SESSIONS` phiên cùng lúc (mặc định 2) và `DEEPGRAM_MAX_SESSION_SEC` mỗi phiên (mặc định 4 giờ).
+- Ngôn ngữ: client gửi `"language"` (`vi` mặc định, `en`, `multi`). Đã đo với key thật: `vi` nhận tiếng Việt rất tốt và phần tiếng Anh xen kẽ ở mức vừa; `multi` tốt nhất cho tiếng Anh nhưng **không hỗ trợ tiếng Việt** (ra chữ sai hoặc rỗng).
+- Người nói: diarization trực tiếp của Deepgram hay gộp mọi người vào 1 nhãn ở phút đầu. Khi dừng, server chạy diarization offline (giống engine local, không tốn thêm tiền Deepgram) trên audio kênh meeting rồi gán lại người nói cho **từng từ** và gửi `final_transcript`.
+- Rớt kết nối tới Deepgram thì tự nối lại, giữ tối đa 60 s audio để gửi bù.
+- Gỡ lỗi: đặt `DEEPGRAM_DEBUG_DUMP=<thư mục>` để lưu nguyên audio nhận từ trình duyệt (PCM16 xen kẽ kênh). Mặc định tắt.
+- Test: `scripts/test_deepgram_bridge.py` (message giả lập), `scripts/test_deepgram_reconnect.py` (Deepgram giả, rớt kết nối giữa phiên, Origin lạ).
 
 ## Dựa trên đâu và khác gì
 
@@ -100,7 +104,7 @@ Gán lại nhãn: mỗi câu lấy người nói chiếm nhiều thời gian nh�
 - `POST /transcribe`: body là PCM16 mono 16 kHz, trả `{"segments": [...], "durationSec"}`.
 - `GET /health`
 
-Biến môi trường: `ASR_MODEL`, `NUM_THREADS`, `SPEAKER_THRESHOLD`, `DIARIZATION_THRESHOLD`, `CORS_ORIGINS`, `MODELS_DIR`.
+Biến môi trường: `ASR_MODEL`, `NUM_THREADS`, `SPEAKER_THRESHOLD`, `DIARIZATION_THRESHOLD`, `CORS_ORIGINS`, `MODELS_DIR`, `MAX_REFINE_MIN` (họp dài hơn thì bỏ diarization offline, mặc định 45), `DEEPGRAM_MAX_SESSIONS`, `DEEPGRAM_MAX_SESSION_SEC`.
 
 ## License của model
 

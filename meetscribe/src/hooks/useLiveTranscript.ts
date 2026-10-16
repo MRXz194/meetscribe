@@ -10,12 +10,12 @@ import {
   type AudioMeter,
   type CaptureMode,
 } from "@/lib/audio/sources";
-import { createTranscriber, type EngineId, type LiveTranscriber } from "@/lib/transcriber/types";
+import { createTranscriber, type DeepgramLanguage, type EngineId, type LiveTranscriber } from "@/lib/transcriber/types";
 import type { TranscriptToken } from "@/lib/types";
 
 export type LiveStatus = "idle" | "starting" | "recording" | "stopping" | "done" | "error";
 
-export type StartOptions = { mode: CaptureMode; withMic: boolean; engine: EngineId };
+export type StartOptions = { mode: CaptureMode; withMic: boolean; engine: EngineId; language?: DeepgramLanguage };
 
 /** Chèn token final theo thời gian: 2 kênh (mic/meeting) có thể chốt câu lệch nhau. */
 function insertByTime(list: TranscriptToken[], tokens: TranscriptToken[]) {
@@ -41,6 +41,8 @@ export function useLiveTranscript(options: { onComplete?: (tokens: TranscriptTok
   const [partialTokens, setPartialTokens] = useState<TranscriptToken[]>([]);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [level, setLevel] = useState(0);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
 
   const transcriberRef = useRef<LiveTranscriber | null>(null);
   const meterRef = useRef<AudioMeter | null>(null);
@@ -55,19 +57,24 @@ export function useLiveTranscript(options: { onComplete?: (tokens: TranscriptTok
   });
 
   const cleanup = useCallback(() => {
+    if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
+    stopTimerRef.current = null;
     meterRef.current?.stop();
     meterRef.current = null;
     stopStreams(streamsRef.current);
     streamsRef.current = [];
   }, []);
 
-  // Đồng hồ + meter âm lượng khi đang ghi
+  // Đồng hồ + meter âm lượng khi đang ghi.
+  // Chỉ setState khi giá trị hiển thị thật sự đổi (giây, mức 0,1): nếu cập nhật 60 lần/giây thì cả trang
+  // (kể cả transcript hàng nghìn đoạn) bị render lại 60 lần/giây, họp 2 tiếng sẽ giật.
   useEffect(() => {
     if (status !== "recording") return;
     let frame = 0;
     const tick = () => {
-      setElapsedMs(Date.now() - startedAtRef.current);
-      setLevel(meterRef.current?.getLevel() ?? 0);
+      const elapsed = Date.now() - startedAtRef.current;
+      setElapsedMs((prev) => (Math.floor(prev / 1000) === Math.floor(elapsed / 1000) ? prev : elapsed));
+      setLevel(Math.round((meterRef.current?.getLevel() ?? 0) * 10) / 10);
       frame = requestAnimationFrame(tick);
     };
     frame = requestAnimationFrame(tick);
@@ -88,6 +95,8 @@ export function useLiveTranscript(options: { onComplete?: (tokens: TranscriptTok
     if (completedRef.current) return;
     completedRef.current = true;
     cleanup();
+    setNotice(null);
+    setWarning(null);
     setPartialTokens([]);
     setStatus("done");
     finishResolverRef.current?.(finalRef.current);
@@ -96,6 +105,7 @@ export function useLiveTranscript(options: { onComplete?: (tokens: TranscriptTok
   }, [cleanup]);
 
   const stoppingRef = useRef<Promise<TranscriptToken[]> | null>(null);
+  const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const stop = useCallback((): Promise<TranscriptToken[]> => {
     // Dừng chia sẻ cũng bắn sự kiện "ended" → stop() bị gọi lần 2; trả lại đúng promise cũ
@@ -108,14 +118,19 @@ export function useLiveTranscript(options: { onComplete?: (tokens: TranscriptTok
       stopStreams(streamsRef.current);
       transcriberRef.current.stop();
       // Phòng khi engine không gọi onFinished (mất mạng): vẫn trả kết quả đã có
-      setTimeout(() => finishResolverRef.current && finish(), transcriberRef.current.stopTimeoutMs);
+      stopTimerRef.current = setTimeout(() => finishResolverRef.current && finish(), transcriberRef.current.stopTimeoutMs);
     });
     return stoppingRef.current;
   }, [finish]);
 
   const start = useCallback(
-    async ({ mode, withMic, engine }: StartOptions) => {
+    async ({ mode, withMic, engine, language }: StartOptions) => {
       setError(null);
+      setNotice(null);
+      setWarning(null);
+      // Phiên cũ còn sót (ví dụ sau lỗi) thì đóng hẳn trước khi mở phiên mới, tránh rò WebSocket/AudioContext
+      transcriberRef.current?.cancel();
+      transcriberRef.current = null;
       setStatus("starting");
       stoppingRef.current = null;
       completedRef.current = false;
@@ -135,7 +150,7 @@ export function useLiveTranscript(options: { onComplete?: (tokens: TranscriptTok
         meterRef.current = meter;
         meter.onSourceEnded(() => void stop());
 
-        const transcriber = await createTranscriber(engine);
+        const transcriber = await createTranscriber(engine, language);
         transcriberRef.current = transcriber;
         await transcriber.start(
           { meeting, mic },
@@ -151,9 +166,15 @@ export function useLiveTranscript(options: { onComplete?: (tokens: TranscriptTok
               finalRef.current = insertByTime([], finals);
               setFinalTokens(finalRef.current);
             },
+            onNotice: setNotice,
+            onWarning: setWarning,
             onError: (message) => {
-              // Lỗi thì không tự lưu; người dùng chọn "Lưu phần đã ghi được"
+              // Lỗi thì không tự lưu; người dùng chọn "Lưu phần đã ghi được".
+              // Phải đóng hẳn engine: không thì WebSocket và AudioContext vẫn mở, Deepgram vẫn tính tiền.
               completedRef.current = true;
+              transcriberRef.current?.cancel();
+              transcriberRef.current = null;
+              setNotice(null);
               setError(message);
               setStatus("error");
               cleanup();
@@ -176,5 +197,5 @@ export function useLiveTranscript(options: { onComplete?: (tokens: TranscriptTok
     [cleanup, finish, stop],
   );
 
-  return { status, error, finalTokens, partialTokens, elapsedMs, level, start, stop };
+  return { status, error, notice, warning, finalTokens, partialTokens, elapsedMs, level, start, stop };
 }

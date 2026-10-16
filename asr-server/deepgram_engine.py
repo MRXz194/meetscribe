@@ -11,6 +11,7 @@ Như vậy key không bao giờ ra trình duyệt, và phía web dùng y nguyên
 - Kênh meeting: người nói lấy từ diarization của Deepgram.
 - Lọc tiếng vọng giữ nguyên logic is_echo của pipeline local.
 - Lưu ý chi phí: Deepgram tính tiền theo từng kênh, 2 kênh = gấp đôi.
+- Rớt kết nối tới Deepgram thì tự nối lại, giữ tối đa 60 s audio gửi bù (xem run_stream).
 """
 
 from __future__ import annotations
@@ -27,17 +28,36 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import httpx
+import numpy as np
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed
 
-from pipeline import ECHO_HOLD_MS, SAMPLE_RATE, Final, is_echo
+from pipeline import ECHO_HOLD_MS, SAMPLE_RATE, Final, Models, diarize_turns, is_echo, label_by_turns
+from silence import SilenceWatch
 
 log = logging.getLogger("asr.deepgram")
 
 DG_HOST = "api.deepgram.com"
+DG_WS_URL = os.environ.get("DEEPGRAM_WS_URL", f"wss://{DG_HOST}/v1/listen")  # đổi được để test với server giả
 MODEL = os.environ.get("DEEPGRAM_MODEL", "nova-3")
 LANGUAGE = os.environ.get("DEEPGRAM_LANGUAGE", "vi")
+# Đã đo với nova-3: "vi" nhận tiếng Việt rất tốt và xử lý được phần tiếng Anh xen kẽ ở mức vừa; "multi" (code-switching) cho
+# tiếng Anh tốt nhất nhưng KHÔNG hỗ trợ tiếng Việt (ra chữ sai hoặc rỗng); "en" chỉ cho họp hoàn toàn tiếng Anh.
+LANGUAGES = {"vi", "en", "multi"}
+
+
+def pick_language(value: str | None) -> str:
+    return value if value in LANGUAGES else LANGUAGE
+# Chi phí: giới hạn số phiên cùng lúc và độ dài một phiên để lỡ quên tắt cũng không đốt credit
+MAX_SESSIONS = int(os.environ.get("DEEPGRAM_MAX_SESSIONS", "2"))
+# Chỉ để gỡ lỗi: đặt thư mục này thì lưu nguyên audio nhận từ trình duyệt (PCM16 xen kẽ các kênh) để phát lại. Mặc định tắt.
+DEBUG_DUMP_DIR = os.environ.get("DEEPGRAM_DEBUG_DUMP")
+MAX_SESSION_SEC = int(os.environ.get("DEEPGRAM_MAX_SESSION_SEC", str(4 * 3600)))
+# Rớt kết nối tới Deepgram: giữ tối đa chừng này audio chờ gửi bù, thử nối lại với thời gian chờ tăng dần
+RECONNECT_BUFFER_SEC = 60
+RECONNECT_DELAYS = [0.5, 1, 2, 4, 8, 8, 8]
 ENV_FILES = [Path(__file__).parent / ".env", Path(__file__).parent.parent / "meetscribe" / ".env.local"]
 
 
@@ -73,12 +93,27 @@ class _State:
         self.recent_meeting: list[Final] = []
         self.last_speaker = "1"
         self.next_id = 1
+        # Sau khi nối lại, Deepgram tính giờ và đánh số người nói lại từ đầu
+        self.offset_ms = 0
+        self.spk_base = 0
+        self.max_label = 0
+        # Từng từ của mọi câu đã phát (kèm giờ), để khi dừng gán lại người nói theo diarization offline
+        self.words: dict[int, list[Final]] = {}
+        self.emitted_words: list[Final] = []
+
+    def on_reconnect(self, offset_ms: int) -> None:
+        """Phiên Deepgram mới: cộng bù thời gian, và coi người nói là nhãn mới thay vì gộp nhầm với nhãn cũ."""
+        self.offset_ms = offset_ms
+        self.spk_base = self.max_label
+        self.partial = {}
 
     def _speaker(self, channel: str, word: dict | None) -> str:
         if channel == "mic":
             return "me"
         if word is not None and word.get("speaker") is not None:
-            self.last_speaker = str(int(word["speaker"]) + 1)
+            label = int(word["speaker"]) + 1 + self.spk_base
+            self.max_label = max(self.max_label, label)
+            self.last_speaker = str(label)
         return self.last_speaker
 
     def _partial_msg(self, channel: str) -> dict:
@@ -122,35 +157,70 @@ class _State:
                 channel=channel,
                 speaker=spk,
                 text=text,
-                start_ms=int(ws[0]["start"] * 1000),
-                end_ms=int(ws[-1]["end"] * 1000),
+                start_ms=int(ws[0]["start"] * 1000) + self.offset_ms,
+                end_ms=int(ws[-1]["end"] * 1000) + self.offset_ms,
             )
             self.next_id += 1
+            self.words[final.id] = [
+                Final(0, channel, spk, w.get("punctuated_word") or w.get("word", ""),
+                      int(w["start"] * 1000) + self.offset_ms, int(w["end"] * 1000) + self.offset_ms)
+                for w in ws
+            ]
             if channel == "mic" and self.echo_filter:
                 self.held.append((final, time.monotonic()))
             else:
                 if channel == "meeting":
                     self.recent_meeting.append(final)
-                out.append(final.to_json())
+                out.append(self._emit(final))
         out.append(self._partial_msg(channel))
         return out
 
     def release(self, force: bool) -> list[dict]:
+        # Luôn dọn recent_meeting, kể cả khi không ghi mic (không có câu chờ), để họp dài không phình bộ nhớ
+        latest = max((f.end_ms for f in self.recent_meeting), default=0)
+        self.recent_meeting = [f for f in self.recent_meeting if latest - f.end_ms < 15000]
         now = time.monotonic()
         ready = [(f, t) for f, t in self.held if force or (now - t) * 1000 >= ECHO_HOLD_MS]
         if not ready:
             return []
         self.held = [h for h in self.held if h not in ready]
-        latest = max((f.end_ms for f in self.recent_meeting), default=0)
-        self.recent_meeting = [f for f in self.recent_meeting if latest - f.end_ms < 15000]
-        out = [f.to_json() for f, _ in ready if not is_echo(f, self.recent_meeting)]
+        out = [self._emit(f) for f, _ in ready if not is_echo(f, self.recent_meeting)]
+        for f, _ in ready:
+            self.words.pop(f.id, None)
         return out + [self._partial_msg("mic")]
 
+    def _emit(self, final: Final) -> dict:
+        self.emitted_words += self.words.pop(final.id, [])
+        return final.to_json()
 
-def _stream_url(n_channels: int) -> str:
+    def refine(self, meeting_audio: list) -> dict | None:
+        """Diarization trực tiếp của Deepgram hay gộp mọi người vào 1 nhãn ở phút đầu và tách sai giữa câu.
+        Khi dừng: chạy diarization offline (giống engine local) trên audio kênh meeting, gán người nói cho TỪNG TỪ
+        rồi gom lại thành câu. Không tốn thêm tiền Deepgram. None nếu không chạy được → giữ nhãn live."""
+        turns = diarize_turns(Models.get(), meeting_audio)
+        if not turns or not self.emitted_words:
+            return None
+        labeled, n = label_by_turns(self.emitted_words, turns)
+        segments: list[dict] = []
+        for w in labeled:
+            last = segments[-1] if segments else None
+            if (
+                last
+                and last["channel"] == w["channel"]
+                and last["speaker"] == w["speaker"]
+                and w["startMs"] - last["endMs"] < 2000
+            ):
+                last["text"] += " " + w["text"]
+                last["endMs"] = w["endMs"]
+            else:
+                segments.append({**w, "id": len(segments) + 1})
+        return {"type": "final_transcript", "segments": segments, "speakers": n}
+
+
+def _stream_url(n_channels: int, language: str) -> str:
     params = {
         "model": MODEL,
-        "language": LANGUAGE,
+        "language": language,
         "encoding": "linear16",
         "sample_rate": SAMPLE_RATE,
         "channels": n_channels,
@@ -161,37 +231,63 @@ def _stream_url(n_channels: int) -> str:
         "diarize": "true",
         "endpointing": 300,
     }
-    return f"wss://{DG_HOST}/v1/listen?{urlencode(params)}"
+    return f"{DG_WS_URL}?{urlencode(params)}"
 
 
-async def run_stream(ws: WebSocket, channels: list[str]) -> None:
+_active = 0
+
+
+async def run_stream(ws: WebSocket, channels: list[str], language: str | None = None) -> None:
     """Xử lý một phiên ghi sau khi trình duyệt gửi start với engine=deepgram."""
+    global _active
+    language = pick_language(language)
     key = api_key()
     if not key:
         await ws.send_json({"type": "error", "message": "Chưa có DEEPGRAM_API_KEY trong meetscribe/.env.local"})
         return
-    try:
-        dg = await connect(
-            _stream_url(len(channels)),
+    if _active >= MAX_SESSIONS:
+        await ws.send_json({"type": "error", "message": f"Đang có {_active} phiên Deepgram, tối đa {MAX_SESSIONS}"})
+        return
+
+    async def open_dg():
+        return await connect(
+            _stream_url(len(channels), language),
             additional_headers={"Authorization": f"Token {key}"},
             open_timeout=10,
             max_size=None,
         )
+
+    try:
+        first = await open_dg()
     except Exception as err:  # noqa: BLE001 - key sai, hết credit, mất mạng… đều báo cho người dùng
         log.warning("deepgram connect failed: %s", err)
         await ws.send_json({"type": "error", "message": f"Không kết nối được Deepgram: {err}"})
         return
 
+    _active += 1
     state = _State(channels)
     frame_bytes = 2 * len(channels)
+    max_pending = RECONNECT_BUFFER_SEC * SAMPLE_RATE * frame_bytes
     stopped = asyncio.Event()
+    close_sent = False  # đã gửi CloseStream: Deepgram trả nốt rồi đóng, không cần nối lại nữa
+    watch = SilenceWatch(channels)
+    meeting_idx = channels.index("meeting") if "meeting" in channels else None
+    meeting_audio: list[np.ndarray] = []  # kênh meeting (int16) cho bước diarization offline khi dừng
+    dump = None
+    if DEBUG_DUMP_DIR:
+        Path(DEBUG_DUMP_DIR).mkdir(parents=True, exist_ok=True)
+        dump = open(Path(DEBUG_DUMP_DIR) / f"{time.strftime('%H%M%S')}-{'_'.join(channels)}.pcm", "wb")
     started = time.perf_counter()
-    audio_bytes = 0
-    log.info("deepgram session start channels=%s model=%s", channels, MODEL)
+    audio_bytes = 0  # tổng audio đã nhận từ trình duyệt
+    pending = bytearray()  # audio nhận được lúc đang mất kết nối Deepgram
+    # Kết nối Deepgram hiện tại, None khi đang nối lại. Gán ngay kết nối đầu: trình duyệt gửi audio từ trước khi
+    # nhận "ready", nếu để None thì frame đầu rơi vào hàng chờ và bị mất.
+    dg = first
+    log.info("deepgram session start channels=%s model=%s language=%s", channels, MODEL, language)
     await ws.send_json({"type": "ready"})
 
     async def browser_to_deepgram() -> None:
-        nonlocal audio_bytes
+        nonlocal audio_bytes, close_sent
         while True:
             msg = await ws.receive()
             if msg["type"] == "websocket.disconnect":
@@ -199,56 +295,147 @@ async def run_stream(ws: WebSocket, channels: list[str]) -> None:
             if msg.get("bytes") is not None:
                 pcm = msg["bytes"][: len(msg["bytes"]) // frame_bytes * frame_bytes]
                 audio_bytes += len(pcm)
-                await dg.send(pcm)
+                watch.feed(pcm)
+                if meeting_idx is not None:
+                    meeting_audio.append(
+                        np.frombuffer(pcm, dtype=np.int16).reshape(-1, len(channels))[:, meeting_idx].copy()
+                    )
+                if dump is not None:
+                    dump.write(pcm)
+                if dg is not None:
+                    try:
+                        await dg.send(pcm)
+                        continue
+                    except ConnectionClosed:
+                        pass  # supervisor sẽ nối lại; frame này vào hàng chờ
+                pending.extend(pcm)
+                if len(pending) > max_pending:
+                    # Bỏ phần cũ nhất; offset thời gian được tính lại từ phần còn giữ khi nối lại
+                    del pending[: len(pending) - max_pending]
             elif msg.get("text") and json.loads(msg["text"]).get("type") == "stop":
-                # Deepgram xử lý nốt phần audio đã nhận, gửi kết quả cuối rồi tự đóng kết nối
-                await dg.send(json.dumps({"type": "CloseStream"}))
                 stopped.set()
+                if dg is not None:
+                    try:
+                        # Deepgram xử lý nốt phần audio đã nhận, gửi kết quả cuối rồi tự đóng kết nối
+                        await dg.send(json.dumps({"type": "CloseStream"}))
+                        close_sent = True
+                    except ConnectionClosed:
+                        pass  # supervisor thấy stopped sẽ nối lại, gửi bù rồi đóng
                 return
 
-    async def deepgram_to_browser() -> None:
-        async for raw in dg:
-            for out in state.handle(json.loads(raw)):
-                await ws.send_json(out)
+    async def supervisor() -> None:
+        """Đọc kết quả Deepgram; rớt kết nối giữa chừng thì nối lại và gửi bù audio đã giữ."""
+        nonlocal dg, close_sent
+        conn = first
+        retry = 0
+        n_results = n_text = 0
+        while True:
+            dg = conn
+            try:
+                async for raw in conn:
+                    msg = json.loads(raw)
+                    if msg.get("type") == "Results":
+                        n_results += 1
+                        alt = (msg.get("channel", {}).get("alternatives") or [{}])[0]
+                        if alt.get("transcript"):
+                            n_text += 1
+                            if n_text <= 3:
+                                log.info("deepgram first text results: ch=%s final=%s %r", msg.get("channel_index"), msg.get("is_final"), alt["transcript"][:80])
+                    elif msg.get("type") != "Metadata":
+                        log.info("deepgram message: %s", str(msg)[:200])
+                    for out in state.handle(msg):
+                        await ws.send_json(out)
+            except ConnectionClosed:
+                pass
+            dg = None
+            log.info(
+                "deepgram connection closed code=%s reason=%r stopped=%s pending=%dB results=%d with_text=%d",
+                conn.close_code, conn.close_reason, stopped.is_set(), len(pending), n_results, n_text,
+            )
+            if close_sent or (stopped.is_set() and not pending):
+                return
+            # Rớt giữa chừng, hoặc đã bấm dừng nhưng còn audio chưa gửi: nối lại
+            await ws.send_json({"type": "status", "message": "reconnecting"})
+            while True:
+                if retry >= len(RECONNECT_DELAYS):
+                    raise RuntimeError("Mất kết nối Deepgram và không nối lại được (kiểm tra mạng, key hoặc credit)")
+                await asyncio.sleep(RECONNECT_DELAYS[retry])
+                retry += 1
+                try:
+                    conn = await open_dg()
+                    break
+                except Exception as err:  # noqa: BLE001
+                    log.warning("deepgram reconnect %d failed: %s", retry, err)
+            # Không có await giữa lúc tính offset và lúc lấy pending nên con số này chính xác
+            state.on_reconnect((audio_bytes - len(pending)) * 1000 // (frame_bytes * SAMPLE_RATE))
+            while pending:
+                chunk = bytes(pending)
+                pending.clear()
+                await conn.send(chunk)
+            if stopped.is_set():
+                await conn.send(json.dumps({"type": "CloseStream"}))
+                close_sent = True
+            retry = 0
+            log.info("deepgram reconnected, offset=%dms", state.offset_ms)
 
     async def ticker() -> None:
         while True:
             await asyncio.sleep(0.3)
-            for out in state.release(force=False):
+            if time.perf_counter() - started > MAX_SESSION_SEC:
+                raise RuntimeError(f"Phiên Deepgram quá {MAX_SESSION_SEC // 3600} giờ, tự dừng để tránh tốn credit")
+            for out in state.release(force=False) + watch.poll():
                 await ws.send_json(out)
 
-    reader = asyncio.create_task(deepgram_to_browser())
-    tick = asyncio.create_task(ticker())
+    tasks = [
+        asyncio.create_task(browser_to_deepgram()),
+        asyncio.create_task(supervisor()),
+        asyncio.create_task(ticker()),
+    ]
+    sender, sup, tick = tasks
     try:
-        sender = asyncio.create_task(browser_to_deepgram())
-        done, _ = await asyncio.wait({sender, reader}, return_when=asyncio.FIRST_COMPLETED)
-        if sender in done:
-            sender.result()  # ném lỗi nếu trình duyệt rớt kết nối
-            await asyncio.wait_for(reader, timeout=30)
-        else:
-            reader.result()
-            if not stopped.is_set():
-                raise RuntimeError("Deepgram đóng kết nối giữa chừng (kiểm tra key hoặc credit)")
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        if tick in done:
+            tick.result()
+        if sup in done:
+            sup.result()  # ném lỗi nếu nối lại thất bại
+        # Tới đây: trình duyệt đã gửi stop (hoặc rớt kết nối, sender.result() sẽ ném)
+        await asyncio.wait_for(asyncio.gather(sender, sup), timeout=60)
         for out in state.release(force=True):
             await ws.send_json(out)
         for name in channels:
             await ws.send_json({"type": "partial", "channel": name, "speaker": "", "text": ""})
+        await ws.send_json({"type": "status", "message": "refining"})
+        t = time.perf_counter()
+        try:
+            refined = await asyncio.to_thread(state.refine, meeting_audio)
+        except Exception:  # noqa: BLE001 - lỗi bước này thì vẫn giữ nhãn live
+            log.exception("deepgram refine failed")
+            refined = None
+        if refined:
+            await ws.send_json(refined)
+        log.info("deepgram refine %.1fs speakers=%s", time.perf_counter() - t, refined["speakers"] if refined else "-")
         await ws.send_json({"type": "done"})
         log.info(
-            "deepgram session done audio=%.1fs wall=%.1fs",
+            "deepgram session done audio=%.1fs wall=%.1fs %s",
             audio_bytes / frame_bytes / SAMPLE_RATE,
             time.perf_counter() - started,
+            watch.summary(),
         )
     finally:
-        tick.cancel()
-        reader.cancel()
-        await dg.close()
+        _active -= 1
+        if dump is not None:
+            dump.close()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if dg is not None:
+            await dg.close()
 
 
 # ---------------------------------------------------------------- file
 
 
-def transcribe_pcm(pcm16: bytes) -> list[dict]:
+def transcribe_pcm(pcm16: bytes, language: str | None = None) -> list[dict]:
     """Gửi cả file (PCM16 mono 16 kHz) lên Deepgram, trả về câu theo người nói giống engine local."""
     key = api_key()
     if not key:
@@ -261,7 +448,7 @@ def transcribe_pcm(pcm16: bytes) -> list[dict]:
         w.writeframes(pcm16)
     params = {
         "model": MODEL,
-        "language": LANGUAGE,
+        "language": pick_language(language),
         "diarize": "true",
         "punctuate": "true",
         "smart_format": "true",

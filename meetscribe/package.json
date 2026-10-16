@@ -15,7 +15,6 @@
     "@ai-sdk/openai": "^4.0.94",
     "@ai-sdk/openai-compatible": "^3.0.69",
     "@base-ui/react": "^1.9.0",
-    "@soniox/speech-to-text-web": "^1.4.0",
     "ai": "^7.0.141",
     "class-variance-authority": "^0.7.1",
     "cn": "^0.4.0",

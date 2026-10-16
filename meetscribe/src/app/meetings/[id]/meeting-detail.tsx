@@ -78,7 +78,7 @@ export function MeetingDetail() {
     load().catch(() => toast.error("Không tải được cuộc họp"));
   }, [load]);
 
-  // File upload đang được Soniox xử lý: poll tới khi xong
+  // File upload đang được xử lý nền: poll tới khi xong
   useEffect(() => {
     if (meeting?.status !== "processing") return;
     const timer = setInterval(load, 2000);

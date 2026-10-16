@@ -23,10 +23,11 @@ import { TranscriptView } from "@/components/transcript-view";
 import { FloatingTranscript } from "@/components/floating-transcript";
 import { useLiveTranscript } from "@/hooks/useLiveTranscript";
 import { useEngine } from "@/hooks/useEngine";
+import { useDeepgramLanguage } from "@/hooks/useDeepgramLanguage";
 import { useAsrHealth } from "@/hooks/useAsrHealth";
 import { useDocumentPip } from "@/hooks/useDocumentPip";
 import { buildSegments, defaultSpeakerName, formatClock } from "@/lib/transcript";
-import { ENGINES, VIA_ASR_SERVER, type EngineId } from "@/lib/transcriber/types";
+import { DEEPGRAM_LANGUAGES, ENGINES, VIA_ASR_SERVER, type DeepgramLanguage, type EngineId } from "@/lib/transcriber/types";
 import type { CaptureMode } from "@/lib/audio/sources";
 import type { Meeting, TranscriptToken } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -68,6 +69,7 @@ export function Recorder() {
   const [mode, setMode] = useState<CaptureMode>("tab");
   const [withMic, setWithMic] = useState(true);
   const [engine, setEngine] = useEngine();
+  const [language, setLanguage] = useDeepgramLanguage();
   const viaAsr = VIA_ASR_SERVER.includes(engine);
   const health = useAsrHealth(viaAsr);
   const deepgramMissing = engine === "deepgram" && health.state === "ok" && !health.deepgram;
@@ -191,7 +193,7 @@ export function Recorder() {
 
             <div className="space-y-2">
               <span className="text-sm font-medium">Engine nhận dạng</span>
-              <div className="grid grid-cols-3 gap-1 rounded-lg border p-1">
+              <div className="grid grid-cols-2 gap-1 rounded-lg border p-1">
                 {(Object.keys(ENGINES) as EngineId[]).map((id) => (
                   <button
                     key={id}
@@ -208,6 +210,29 @@ export function Recorder() {
                 ))}
               </div>
               <p className="text-xs text-muted-foreground">{ENGINES[engine].desc}</p>
+              {engine === "deepgram" && (
+                <div className="space-y-1">
+                  <div className="grid grid-cols-3 gap-1 rounded-lg border p-1" role="radiogroup" aria-label="Ngôn ngữ Deepgram">
+                    {(Object.keys(DEEPGRAM_LANGUAGES) as DeepgramLanguage[]).map((id) => (
+                      <button
+                        key={id}
+                        type="button"
+                        role="radio"
+                        aria-checked={language === id}
+                        disabled={active}
+                        onClick={() => setLanguage(id)}
+                        className={cn(
+                          "rounded-md px-1.5 py-1 text-xs font-medium transition-colors disabled:opacity-60",
+                          language === id ? "bg-primary text-primary-foreground" : "hover:bg-muted",
+                        )}
+                      >
+                        {DEEPGRAM_LANGUAGES[id].label}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-xs text-muted-foreground">{DEEPGRAM_LANGUAGES[language].desc}</p>
+                </div>
+              )}
               {viaAsr &&
                 (deepgramMissing ? (
                   <div className="space-y-1.5 rounded-lg border border-destructive/40 bg-destructive/5 p-2.5 text-xs">
@@ -247,7 +272,7 @@ export function Recorder() {
                 size="lg"
                 className="w-full"
                 disabled={saving || live.status === "starting" || !asrReady}
-                onClick={() => live.start({ mode, withMic, engine })}
+                onClick={() => live.start({ mode, withMic, engine, language })}
               >
                 {saving ? <Loader2Icon className="animate-spin" /> : <span className="size-2 rounded-full bg-red-500" />}
                 {saving ? "Đang lưu…" : "Bắt đầu ghi"}
@@ -270,6 +295,24 @@ export function Recorder() {
             </p>
           </CardContent>
         </Card>
+
+        {live.warning && live.status === "recording" && (
+          <Card className="border-amber-500/40">
+            <CardContent className="flex gap-3 text-sm">
+              <TriangleAlertIcon className="size-5 shrink-0 text-amber-500" />
+              <p>{live.warning}</p>
+            </CardContent>
+          </Card>
+        )}
+
+        {live.notice && (
+          <Card className="border-amber-500/40">
+            <CardContent className="flex gap-3 text-sm">
+              <Loader2Icon className="size-5 shrink-0 animate-spin text-amber-500" />
+              <p>{live.notice}</p>
+            </CardContent>
+          </Card>
+        )}
 
         {live.error && (
           <Card className="border-destructive/40">

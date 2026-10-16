@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment } from "react";
+import { Fragment, memo } from "react";
 import { cn } from "@/lib/utils";
 import { formatClock } from "@/lib/transcript";
 import type { Segment } from "@/lib/types";
@@ -43,6 +43,52 @@ type Props = {
   query?: string;
 };
 
+type RowProps = {
+  seg: Segment;
+  tail?: string;
+  query: string;
+  nameOf: (speaker: string) => string;
+  onSpeakerClick?: (speaker: string) => void;
+};
+
+/**
+ * Một đoạn transcript. Memo theo nội dung (không theo identity của seg, vì buildSegments tạo object mới
+ * mỗi lần có câu mới): họp 2 tiếng có hàng nghìn đoạn, chỉ đoạn thật sự đổi mới phải render lại.
+ * content-visibility: auto để trình duyệt bỏ qua layout/paint các đoạn đang ngoài màn hình.
+ */
+const Row = memo(
+  function Row({ seg, tail, query, nameOf, onSpeakerClick }: RowProps) {
+    return (
+      <div className="grid grid-cols-[3.5rem_1fr] gap-3 [contain-intrinsic-size:auto_3.5rem] [content-visibility:auto]">
+        <span className="pt-0.5 font-mono text-xs text-muted-foreground tabular-nums">{formatClock(seg.startMs)}</span>
+        <div>
+          <button
+            type="button"
+            disabled={!onSpeakerClick}
+            onClick={() => onSpeakerClick?.(seg.speaker)}
+            className={cn("text-sm font-semibold", speakerColor(seg.speaker), onSpeakerClick && "hover:underline")}
+            title={onSpeakerClick ? "Bấm để đổi tên" : undefined}
+          >
+            {nameOf(seg.speaker)}
+          </button>
+          <p className="leading-relaxed">
+            {highlight(seg.text, query)}
+            {tail && <span className="text-muted-foreground"> {tail}</span>}
+          </p>
+        </div>
+      </div>
+    );
+  },
+  (a, b) =>
+    a.seg.text === b.seg.text &&
+    a.seg.speaker === b.seg.speaker &&
+    a.seg.startMs === b.seg.startMs &&
+    a.tail === b.tail &&
+    a.query === b.query &&
+    a.nameOf === b.nameOf &&
+    a.onSpeakerClick === b.onSpeakerClick,
+);
+
 export function TranscriptView({ segments, partials = [], nameOf, onSpeakerClick, query = "" }: Props) {
   const visible = query
     ? segments.filter((s) => s.text.toLowerCase().includes(query.toLowerCase()))
@@ -56,32 +102,14 @@ export function TranscriptView({ segments, partials = [], nameOf, onSpeakerClick
   return (
     <div className="space-y-4">
       {visible.map((seg, i) => (
-        <div key={`${seg.startMs}-${i}`} className="grid grid-cols-[3.5rem_1fr] gap-3">
-          <span className="pt-0.5 font-mono text-xs text-muted-foreground tabular-nums">
-            {formatClock(seg.startMs)}
-          </span>
-          <div>
-            <button
-              type="button"
-              disabled={!onSpeakerClick}
-              onClick={() => onSpeakerClick?.(seg.speaker)}
-              className={cn(
-                "text-sm font-semibold",
-                speakerColor(seg.speaker),
-                onSpeakerClick && "hover:underline",
-              )}
-              title={onSpeakerClick ? "Bấm để đổi tên" : undefined}
-            >
-              {nameOf(seg.speaker)}
-            </button>
-            <p className="leading-relaxed">
-              {highlight(seg.text, query)}
-              {inline && i === visible.length - 1 && (
-                <span className="text-muted-foreground"> {inline.text.trim()}</span>
-              )}
-            </p>
-          </div>
-        </div>
+        <Row
+          key={`${seg.startMs}-${i}`}
+          seg={seg}
+          tail={inline && i === visible.length - 1 ? inline.text.trim() : undefined}
+          query={query}
+          nameOf={nameOf}
+          onSpeakerClick={onSpeakerClick}
+        />
       ))}
       {separate.map((p) => (
         <div key={p.speaker} className="grid grid-cols-[3.5rem_1fr] gap-3">

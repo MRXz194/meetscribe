@@ -17,7 +17,6 @@ npm run dev:all              # bật cả ASR server (cổng 8000) lẫn web (ht
 - **Nhận dạng giọng nói**: chọn engine ngay trên trang Ghi.
   - **Local** (mặc định): sherpa-onnx trên CPU, không cần key, audio không rời máy.
   - **Deepgram**: cloud, nova-3 tiếng Việt, tách người nói. Cần `DEEPGRAM_API_KEY` trong `.env.local` (đăng ký có credit miễn phí). Audio đi qua asr-server rồi sang Deepgram nên key không lộ ra trình duyệt.
-  - **Soniox**: cloud trả phí, cần `SONIOX_API_KEY`.
 - **Tóm tắt**: miễn phí với `GOOGLE_GENERATIVE_AI_API_KEY` (Google AI Studio, không cần thẻ) hoặc `GROQ_API_KEY`. Muốn offline hoàn toàn thì dùng `LLM_PROVIDER=ollama`.
 - Dùng Chrome hoặc Edge trên desktop.
 
@@ -44,22 +43,22 @@ Trình duyệt                                         Next.js server (localhost
 ┌──────────────────────────────────┐                ┌──────────────────────────────┐
 │ lib/audio/sources.ts             │                │ /api/meetings    lưu JSON    │
 │  tab | màn hình, mic (2 nguồn)   │                │ /api/.../summarize  LLM      │
-│ lib/transcriber/                 │                │ /api/soniox-key, /api/upload │
-│  ├ local.ts  ─ AudioWorklet ─────┼── WebSocket ─► │  (chỉ dùng cho engine Soniox)│
-│  │   2 kênh PCM16 16 kHz         │                └──────────────────────────────┘
-│  └ soniox.ts (tuỳ chọn, cloud)   │
+│ lib/transcriber/                 │                │                              │
+│  └ local.ts  ─ AudioWorklet ─────┼── WebSocket ─► │                              │
+│      2 kênh PCM16 16 kHz         │                └──────────────────────────────┘
+│                                  │
 │ hooks/useLiveTranscript.ts       │                ASR server (localhost:8000, ../asr-server)
 └──────────────────────────────────┘ ─────────────► VAD → Zipformer-vi → CAM++ → SpeakerTracker
 ```
 
 - **Nguồn audio là adapter** (`src/lib/audio/sources.ts`): mỗi nguồn trả về một `MediaStream`. Thêm Chrome extension hay bot sau này chỉ là thêm một nguồn.
-- **ASR là plugin** (`src/lib/transcriber/types.ts`): UI chỉ biết interface `LiveTranscriber`. Hiện có 2 bản: `LocalTranscriber` (tự host, miễn phí) và `SonioxTranscriber` (cloud); đổi ngay trên giao diện.
+- **ASR là plugin** (`src/lib/transcriber/types.ts`): UI chỉ biết interface `LiveTranscriber`. Cả hai engine (Local và Deepgram) đều đi qua asr-server bằng `LocalTranscriber`; đổi ngay trên giao diện.
 - **Tách kênh mic/cuộc họp** (engine Local): AudioContext chạy ở 16 kHz (trình duyệt tự hạ mẫu), AudioWorklet chỉ đóng gói PCM 2 kênh. Server biết chắc kênh mic là "Tôi", chỉ phải đoán người nói ở kênh cuộc họp.
 - **Nhãn người nói 2 bước** (engine Local): lúc đang ghi là nhãn tạm (gom cụm online); bấm Dừng thì server chạy diarization offline của sherpa-onnx trên cả cuộc họp và gửi lại bản cuối, UI thay toàn bộ nhãn trước khi lưu.
-- **Key thật không lên trình duyệt** (engine Soniox): server chỉ cấp temporary key có hạn 5 phút.
+- **Key thật không lên trình duyệt** (engine Deepgram): key nằm ở asr-server, trình duyệt chỉ nói chuyện với asr-server.
 - **Lưu trữ** (`src/lib/server/store.ts`): file JSON trong `data/meetings/`, vì bản này chạy localhost. Đổi sang Postgres chỉ cần viết lại file này.
 - **Tóm tắt** (`src/lib/server/summarize.ts`): AI SDK với `Output.object` + schema zod, nên luôn nhận về JSON đúng cấu trúc. Đổi provider bằng biến môi trường.
-- **Upload**: route trả về id ngay, xử lý Soniox async ở nền bằng `after()`, trang chi tiết tự poll. Sau khi xong thì file được xoá khỏi Soniox.
+- **Upload**: trình duyệt giải mã file về PCM 16 kHz, gửi `POST /transcribe` của asr-server (engine đang chọn), rồi lưu như cuộc họp thường.
 
 ## Cấu trúc
 
@@ -67,9 +66,9 @@ Trình duyệt                                         Next.js server (localhost
 src/
 ├─ lib/audio/sources.ts         getMeetingStream, getMicStream, mixStreams (+ meter âm lượng)
 ├─ lib/transcriber/types.ts     interface LiveTranscriber
-├─ lib/transcriber/soniox.ts    SonioxTranscriber
+├─ lib/transcriber/local.ts     LocalTranscriber (local + deepgram qua asr-server)
 ├─ lib/transcript.ts            gộp token → đoạn theo người nói, export TXT/MD/SRT
-├─ lib/server/                  store (JSON), soniox (key + async), summarize (LLM)
+├─ lib/server/                  store (JSON), summarize (LLM)
 ├─ hooks/useLiveTranscript.ts   start/stop, token final + partial, đồng hồ, meter
 └─ app/                         / (danh sách), /record, /meetings/[id], api/*
 ```
